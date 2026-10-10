@@ -71,3 +71,58 @@ def drop_identical_duplicates(df: DataFrame) -> tuple[DataFrame, int]:
               .filter(F.col("_n") == 1)
               .drop("_n"))
     return kept, df.count() - kept.count()
+
+
+def resolve_conflicts(df: DataFrame, large_ratio: float = 1.05, window_days: int = 7,
+                      max_offset: float = 0.10) -> DataFrame:
+    """Rules 3 and 4: leave exactly one row per currency and date.
+
+    - A currency-date with one row is kept as it is ("single").
+    - Rule 3: if the copies differ by large_ratio or more, keep the copy whose
+      central rate is closest to the median of the same currency's single rows
+      within window_days either side ("neighbour_check").
+    - Rule 4: if the copies differ by less than that, nothing shows which is
+      official, so the rates are left empty ("conflict_unresolved").
+    - Safeguard: if even the closest copy is more than max_offset away from its
+      neighbours, or there are no neighbours, the conflict is also unresolved.
+
+    Every output row lists the ids it was chosen from, for audit.
+    """
+    key = ["currency", "ratedate"]
+    whole_group = Window.partitionBy(*key)
+    counted = df.withColumn("_rows", F.count("*").over(whole_group))
+
+    singles = (counted.filter(F.col("_rows") == 1).drop("_rows")
+               .withColumn("resolution", F.lit("single"))
+               .withColumn("candidate_ids", F.array(F.col("id")))
+               .withColumn("conflict_ratio", F.lit(None).cast("double")))
+    conflicts = counted.filter(F.col("_rows") > 1).drop("_rows")
+
+    # Typical rate nearby: median of the same currency's single rows within the window
+    reference = singles.select(F.col("currency").alias("_ref_currency"),
+                               F.col("ratedate").alias("_ref_date"),
+                               F.col("centralrate").alias("_ref_central"))
+    nearby = (F.col("currency") == F.col("_ref_currency")) & \
+             (F.abs(F.datediff(F.col("ratedate"), F.col("_ref_date"))) <= window_days)
+    with_median = (conflicts.join(reference, nearby, "left")
+                   .groupBy(*conflicts.columns)
+                   .agg(F.median("_ref_central").alias("_neighbour_median")))
+
+    ranked = (with_median
+              .withColumn("_off_by", F.abs(F.col("centralrate") / F.col("_neighbour_median") - 1))
+              .withColumn("conflict_ratio",
+                          F.max("centralrate").over(whole_group) / F.min("centralrate").over(whole_group))
+              .withColumn("candidate_ids", F.sort_array(F.collect_list("id").over(whole_group)))
+              .withColumn("_rank", F.row_number().over(
+                  whole_group.orderBy(F.col("_off_by").asc_nulls_last(), F.col("id")))))
+    best = ranked.filter(F.col("_rank") == 1)
+
+    resolvable = ((F.col("conflict_ratio") >= large_ratio)
+                  & F.col("_off_by").isNotNull()
+                  & (F.col("_off_by") <= max_offset))
+    resolved = best.withColumn(
+        "resolution", F.when(resolvable, "neighbour_check").otherwise("conflict_unresolved"))
+    for col in ["id", "currency_raw"] + RATE_COLUMNS:
+        resolved = resolved.withColumn(col, F.when(resolvable, F.col(col)))
+
+    return singles.unionByName(resolved.select(*singles.columns))

@@ -7,6 +7,7 @@ from silver import (
     clean_currency_names,
     drop_excluded_currencies,
     drop_identical_duplicates,
+    resolve_conflicts,
     type_columns,
 )
 
@@ -84,3 +85,76 @@ def test_leaves_conflicting_duplicates_for_later_rules(spark):
     kept, dropped = drop_identical_duplicates(df)
     assert dropped == 0
     assert kept.count() == 2
+
+
+# --- rules 3 and 4: conflicts -----------------------------------------------
+
+CFA_NEIGHBOURS = [[60370, "CFA", "2025-11-26", "2.5377", "2.5477", "2.5577"],
+                  [60400, "CFA", "2025-11-28", "2.5370", "2.5470", "2.5570"]]
+
+
+def resolved_rows(spark, rows):
+    out = resolve_conflicts(prepared(spark, rows))
+    return {(r["currency"], str(r["ratedate"])): r for r in out.collect()}
+
+
+def test_single_rows_pass_through_unchanged(spark):
+    rows = resolved_rows(spark, CFA_NEIGHBOURS)
+    row = rows[("CFA", "2025-11-26")]
+    assert row["resolution"] == "single"
+    assert row["centralrate"] == pytest.approx(2.5477)
+    assert row["candidate_ids"] == [60370]
+
+
+def test_large_conflict_keeps_the_plausible_copy_even_when_it_is_older(spark):
+    # Real case: the later id carries 1958.95, not a CFA rate
+    rows = resolved_rows(spark, CFA_NEIGHBOURS + [
+        [60379, "CFA", "2025-11-27", "2.5257", "2.5357", "2.5457"],
+        [60390, "CFA", "2025-11-27", "1958.2715", "1958.9501", "1959.6287"]])
+    row = rows[("CFA", "2025-11-27")]
+    assert row["resolution"] == "neighbour_check"
+    assert row["id"] == 60379
+    assert row["centralrate"] == pytest.approx(2.5357)
+    assert row["candidate_ids"] == [60379, 60390]
+
+
+def test_large_conflict_keeps_the_later_copy_when_that_is_the_plausible_one(spark):
+    rows = resolved_rows(spark, [
+        [49200, "SDR", "2022-03-14", "573.0", "574.4", "575.0"],
+        [49300, "SDR", "2022-03-16", "573.5", "574.5", "575.5"],
+        [49234, "SDR", "2022-03-15", "64.9", "65.2041", "65.5"],
+        [49238, "SDR", "2022-03-15", "572.5", "573.1378", "573.8"]])
+    assert rows[("SDR", "2022-03-15")]["id"] == 49238
+
+
+def test_small_conflict_is_left_empty_and_flagged(spark):
+    rows = resolved_rows(spark, [
+        [55040, "CFA", "2024-02-21", "2.6200", "2.6300", "2.6400"],
+        [55057, "CFA", "2024-02-22", "2.6244", "2.6344", "2.6444"],
+        [55069, "CFA", "2024-02-22", "2.6261", "2.6361", "2.6461"]])
+    row = rows[("CFA", "2024-02-22")]
+    assert row["resolution"] == "conflict_unresolved"
+    assert row["centralrate"] is None and row["id"] is None
+    assert row["candidate_ids"] == [55057, 55069]
+
+
+def test_large_conflict_without_neighbours_is_left_unresolved(spark):
+    rows = resolved_rows(spark, [
+        [1, "YEN", "2017-10-09", "2.70", "2.7072", "2.71"],
+        [2, "YEN", "2017-10-09", "46.0", "46.0795", "46.1"]])
+    assert rows[("YEN", "2017-10-09")]["resolution"] == "conflict_unresolved"
+
+
+def test_large_conflict_where_even_the_best_copy_is_far_off_is_unresolved(spark):
+    rows = resolved_rows(spark, [
+        [10, "EURO", "2026-05-22", "1594", "1595", "1596"],
+        [11, "EURO", "2026-05-25", "1300", "1300.0", "1301"],
+        [12, "EURO", "2026-05-25", "1900", "1900.0", "1901"]])
+    assert rows[("EURO", "2026-05-25")]["resolution"] == "conflict_unresolved"
+
+
+def test_output_has_one_row_per_currency_and_date(spark):
+    out = resolve_conflicts(prepared(spark, CFA_NEIGHBOURS + [
+        [60379, "CFA", "2025-11-27", "2.5257", "2.5357", "2.5457"],
+        [60390, "CFA", "2025-11-27", "1958.2715", "1958.9501", "1959.6287"]]))
+    assert out.count() == out.select("currency", "ratedate").distinct().count() == 3

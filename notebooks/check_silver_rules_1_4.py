@@ -1,9 +1,9 @@
-"""Run Silver rules 1 and 2 on the real Bronze snapshot and print the counts.
+"""Run Silver rules 1 to 4 on the real Bronze snapshot and print the counts.
 
 The counts should match what profiling found. Reads only; writes nothing.
 
 Usage (from the project root):
-    python notebooks/check_silver_rules_1_2.py
+    python notebooks/check_silver_rules_1_4.py
 """
 
 import os
@@ -19,13 +19,13 @@ from pyspark.sql import SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
 from silver import (  # noqa: E402
     clean_currency_names, drop_excluded_currencies, drop_identical_duplicates,
-    read_bronze, type_columns,
+    read_bronze, resolve_conflicts, type_columns,
 )
 
 BRONZE = ROOT / "data" / "bronze" / "exchange_rates"
 latest = sorted(BRONZE.glob("*.json"))[-1]
 
-spark = (SparkSession.builder.master("local[*]").appName("check-silver-1-2")
+spark = (SparkSession.builder.master("local[*]").appName("check-silver-1-4")
          .config("spark.sql.shuffle.partitions", "8").getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
 
@@ -44,8 +44,22 @@ print("Rows remaining:", deduped.count())
 conflicts = deduped.groupBy("currency", "ratedate").count().filter(F.col("count") > 1)
 print("Currency-dates still repeated (conflicts for rules 3 and 4):", conflicts.count())
 
-print("\nCurrencies after cleaning:")
-deduped.groupBy("currency").agg(F.count("*").alias("rows"), F.min("ratedate").alias("first"),
-                                F.max("ratedate").alias("last")).orderBy("rows").show(30, truncate=False)
+silver = resolve_conflicts(deduped).cache()
+print("\nSilver rows:", silver.count())
+print("Distinct currency-dates:", silver.select("currency", "ratedate").distinct().count())
+
+print("\nRows by resolution:")
+silver.groupBy("resolution").count().orderBy("resolution").show(truncate=False)
+
+print("Conflicts resolved by the neighbour check:")
+(silver.filter(F.col("resolution") == "neighbour_check")
+ .select("currency", "ratedate", "id", "centralrate", "candidate_ids",
+         F.round("conflict_ratio", 2).alias("conflict_ratio"))
+ .orderBy("ratedate").show(30, truncate=False))
+
+print("Unresolved conflicts that were LARGE (stopped by the safeguard):")
+(silver.filter((F.col("resolution") == "conflict_unresolved") & (F.col("conflict_ratio") >= 1.05))
+ .select("currency", "ratedate", "candidate_ids", F.round("conflict_ratio", 2).alias("conflict_ratio"))
+ .show(30, truncate=False))
 
 spark.stop()
