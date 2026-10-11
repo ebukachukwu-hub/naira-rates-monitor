@@ -126,3 +126,35 @@ def resolve_conflicts(df: DataFrame, large_ratio: float = 1.05, window_days: int
         resolved = resolved.withColumn(col, F.when(resolvable, F.col(col)))
 
     return singles.unionByName(resolved.select(*singles.columns))
+
+
+def flag_rate_order(df: DataFrame) -> DataFrame:
+    """Rule 5: flag rows where buying <= central <= selling fails. Never delete them.
+
+    Profiling found rows where one rate looks mistyped while the others are
+    fine, so the row is kept and the flag lets later steps decide. Empty
+    (unresolved) rows get an empty flag: there is nothing to check.
+    """
+    in_order = (F.col("buyingrate") <= F.col("centralrate")) & (F.col("centralrate") <= F.col("sellingrate"))
+    return df.withColumn("rate_order_valid",
+                         F.when(F.col("centralrate").isNull(), F.lit(None)).otherwise(in_order))
+
+
+SILVER_COLUMNS = ["currency", "ratedate", "buyingrate", "centralrate", "sellingrate",
+                  "rate_order_valid", "resolution", "conflict_ratio", "candidate_ids",
+                  "id", "currency_raw"]
+
+
+def build_silver(raw: DataFrame) -> tuple[DataFrame, dict]:
+    """Apply rules 1 to 5 in order. Returns the Silver table and a count for each step."""
+    typed = type_columns(raw)
+    named = clean_currency_names(typed)
+    kept, excluded = drop_excluded_currencies(named)
+    deduped, identical = drop_identical_duplicates(kept)
+    silver = flag_rate_order(resolve_conflicts(deduped)).select(*SILVER_COLUMNS)
+    report = {
+        "bronze_rows": raw.count(),
+        "excluded_currency_rows": excluded,
+        "identical_duplicates_dropped": identical,
+    }
+    return silver, report

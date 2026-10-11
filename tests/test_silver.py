@@ -6,7 +6,9 @@ from silver import (
     BRONZE_SCHEMA,
     clean_currency_names,
     drop_excluded_currencies,
+    build_silver,
     drop_identical_duplicates,
+    flag_rate_order,
     resolve_conflicts,
     type_columns,
 )
@@ -158,3 +160,43 @@ def test_output_has_one_row_per_currency_and_date(spark):
         [60379, "CFA", "2025-11-27", "2.5257", "2.5357", "2.5457"],
         [60390, "CFA", "2025-11-27", "1958.2715", "1958.9501", "1959.6287"]]))
     assert out.count() == out.select("currency", "ratedate").distinct().count() == 3
+
+
+# --- rule 5: rate order ------------------------------------------------------
+
+def test_flags_rows_in_order_as_valid(spark):
+    df = flag_rate_order(prepared(spark, [[1, "US DOLLAR", "2026-10-08", "1331.1021", "1331.6021", "1332.1021"]]))
+    assert df.first()["rate_order_valid"] is True
+
+
+def test_flags_a_mistyped_central_rate_but_keeps_the_row(spark):
+    # Real case: CFA, 23 Dec 2022, central 0.0714 between 0.7040 and 0.7240
+    df = flag_rate_order(prepared(spark, [[51569, "CFA", "2022-12-23", "0.7040", "0.0714", "0.7240"]]))
+    assert df.count() == 1
+    assert df.first()["rate_order_valid"] is False
+
+
+def test_unresolved_rows_get_an_empty_flag(spark):
+    out = flag_rate_order(resolve_conflicts(prepared(spark, [
+        [55040, "CFA", "2024-02-21", "2.6200", "2.6300", "2.6400"],
+        [55057, "CFA", "2024-02-22", "2.6244", "2.6344", "2.6444"],
+        [55069, "CFA", "2024-02-22", "2.6261", "2.6361", "2.6461"]])))
+    row = [r for r in out.collect() if str(r["ratedate"]) == "2024-02-22"][0]
+    assert row["rate_order_valid"] is None
+
+
+# --- the whole Silver build --------------------------------------------------
+
+def test_build_silver_applies_all_rules_and_reports_counts(spark):
+    raw = make_raw(spark, [
+        [1, "NAIRA", "2010-01-04", "1", "1", "1"],                       # excluded
+        [2, "EURO\t", "2012-08-07", "1", "2", "3"],                      # name cleaned
+        [3, "EURO", "2012-08-07", "1", "2", "3"],                         # identical copy
+        [4, "CFA", "2022-12-23", "0.7040", "0.0714", "0.7240"],           # out of order
+    ])
+    silver, report = build_silver(raw)
+    assert report == {"bronze_rows": 4, "excluded_currency_rows": 1, "identical_duplicates_dropped": 1}
+    rows = {r["currency"]: r for r in silver.collect()}
+    assert set(rows) == {"EURO", "CFA"}
+    assert rows["EURO"]["id"] == 2 and rows["EURO"]["rate_order_valid"] is True
+    assert rows["CFA"]["rate_order_valid"] is False
