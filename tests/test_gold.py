@@ -47,9 +47,10 @@ def test_clustered_errors_do_not_flag_the_correct_value_between_them(spark):
     assert flags(spark, values) == [False, False, False, True, False, True, False, False, False]
 
 
-def test_a_real_move_that_stays_is_not_flagged(spark):
-    # Shape of June 2016: about 1.42x in one day, then stays
-    values = [196.5] * 6 + [279.5, 283.5, 283.0, 282.5, 282.0, 281.5]
+def test_a_single_currency_move_of_30_percent_that_stays_is_not_flagged(spark):
+    # A move in one currency only (no market move to subtract). The day before
+    # the step sits (1 + s) / 2 from its reference: 1.15x for s = 1.3.
+    values = [196.5] * 6 + [255.45, 256.0, 255.8, 256.2, 255.9, 256.1]
     assert not any(flags(spark, values))
 
 
@@ -98,3 +99,62 @@ def test_data_quality_counts_every_kind_of_row(spark):
     assert q["unresolved_conflicts"] == 1
     assert q["jump_suspects"] == 1
     assert q["usable_rows"] == 10
+
+
+# --- market adjustment ----------------------------------------------------------
+
+QUIET = ["EURO", "POUNDS STERLING", "YEN", "RIYAL", "SDR", "SWISS FRANC", "YUAN/RENMINBI", "DANISH KRONA"]
+
+
+def market(spark, overrides=None, step=None):
+    """Eight currencies over 11 weekdays, each flat at 100. Optionally every
+    currency steps up by `step` from day 6 (a naira move), and `overrides`
+    sets {(currency, day_index): value} on top."""
+    frames = None
+    for currency in QUIET:
+        values = [100.0 * (step if step and i >= 6 else 1) for i in range(11)]
+        for (cur, i), v in (overrides or {}).items():
+            if cur == currency:
+                values[i] = v
+        df = series(spark, currency, "2024-01-15", values)
+        frames = df if frames is None else frames.unionByName(df)
+    out = flag_jumps(valid_rates(frames))
+    return {(r["currency"], r["ratedate"]): r for r in out.collect()}
+
+
+def day(i):
+    days, d = [], date(2024, 1, 15)
+    while len(days) <= i:
+        if d.weekday() < 5:
+            days.append(d)
+        d += timedelta(days=1)
+    return days[i]
+
+
+def test_a_market_wide_move_is_not_flagged_even_when_each_currency_looks_off(spark):
+    rows = market(spark, step=1.8)
+    edge = rows[("EURO", day(5))]            # last day before the step: reference straddles
+    assert edge["jump_ratio"] >= 1.2         # on its own it looks off...
+    assert not any(r["jump_suspect"] for r in rows.values())   # ...but the market moved
+
+
+def test_an_isolated_typo_on_a_quiet_day_is_flagged(spark):
+    # Shape of pound sterling, 10 Nov 2003: about 1.48x off while nothing else moved
+    rows = market(spark, overrides={("POUNDS STERLING", 5): 148.0})
+    flagged = [k for k, r in rows.items() if r["jump_suspect"]]
+    assert flagged == [("POUNDS STERLING", day(5))]
+
+
+def test_a_pair_of_linked_errors_is_flagged(spark):
+    # Shape of CFA and WAUA, 26 Jan 2024: two currencies 1.32x down, the rest still
+    rows = market(spark, overrides={("EURO", 5): 75.8, ("SDR", 5): 75.8})
+    flagged = sorted(k for k, r in rows.items() if r["jump_suspect"])
+    assert flagged == [("EURO", day(5)), ("SDR", day(5))]
+
+
+def test_an_error_on_top_of_a_market_move_is_flagged(spark):
+    # Shape of yen, 24 Feb 2015: off far more than the market moved that day
+    normal = market(spark, step=1.8)[("YEN", day(6))]["centralrate"]
+    rows = market(spark, step=1.8, overrides={("YEN", 6): normal * 1.3})
+    flagged = [k for k, r in rows.items() if r["jump_suspect"]]
+    assert flagged == [("YEN", day(6))]
